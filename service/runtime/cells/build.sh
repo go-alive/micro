@@ -1,22 +1,16 @@
 #!/bin/bash
 
-set -e
+IMAGE=micro/cells
 
-if [ ! $IMAGE ]; then
-  IMAGE=micro/cells
-fi
-
-echo ${PASSWORD} | docker login $DOCKER_DOMAIN -u ${USERNAME} --password-stdin
+echo ${PASSWORD} | docker login -u ${USERNAME} --password-stdin
 
 
 ls | while read dir; do
   if [ ! -d ${dir} ]; then
     continue
   fi
-  if [ $DOCKER_DOMAIN ]; then
-    TAGPREFIX=$DOCKER_DOMAIN/
-  fi
-  TAG=$TAGPREFIX$IMAGE:${dir}
+
+  TAG=$IMAGE:${dir}
 
   pushd ${dir} &>/dev/null
   echo Building $TAG

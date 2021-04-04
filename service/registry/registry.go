@@ -1,92 +1,161 @@
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Original source: github.com/micro/go-micro/v3/registry/registry.go
-
 // Package registry is the micro registry
 package registry
 
 import (
-	"errors"
+	"context"
+	"time"
+
+	"github.com/go-alive/cli"
+	"github.com/go-alive/go-micro"
+	log "github.com/go-alive/go-micro/logger"
+	"github.com/go-alive/go-micro/registry"
+	"github.com/go-alive/go-micro/registry/service"
+	pb "github.com/go-alive/go-micro/registry/service/proto"
+	rcli "github.com/go-alive/micro/client/cli"
+	"github.com/go-alive/micro/internal/helper"
+	"github.com/go-alive/micro/service/registry/handler"
 )
 
 var (
-	// DefaultRegistry implementation
-	DefaultRegistry Registry
-	// ErrNotFound error when GetService is called
-	ErrNotFound = errors.New("service not found")
-	// ErrWatcherStopped error when watcher is stopped
-	ErrWatcherStopped = errors.New("watcher stopped")
+	// Name of the registry
+	Name = "go.micro.registry"
+	// The address of the registry
+	Address = ":8000"
+	// Topic to publish registry events to
+	Topic = "go.micro.registry.events"
 )
 
-const (
-	// WildcardDomain indicates any domain
-	WildcardDomain = "*"
-	// DefaultDomain to use if none was provided in options
-	DefaultDomain = "micro"
-)
-
-// Registry provides an interface for service discovery
-// and an abstraction over varying implementations
-// {consul, etcd, zookeeper, ...}
-type Registry interface {
-	Init(...Option) error
-	Options() Options
-	Register(*Service, ...RegisterOption) error
-	Deregister(*Service, ...DeregisterOption) error
-	GetService(string, ...GetOption) ([]*Service, error)
-	ListServices(...ListOption) ([]*Service, error)
-	Watch(...WatchOption) (Watcher, error)
-	String() string
+// Sub processes registry events
+type subscriber struct {
+	// id is registry id
+	Id string
+	// registry is service registry
+	Registry registry.Registry
 }
 
-type Service struct {
-	Name      string            `json:"name"`
-	Version   string            `json:"version"`
-	Metadata  map[string]string `json:"metadata"`
-	Endpoints []*Endpoint       `json:"endpoints"`
-	Nodes     []*Node           `json:"nodes"`
+// Process processes registry events
+func (s *subscriber) Process(ctx context.Context, event *pb.Event) error {
+	if event.Id == s.Id {
+		log.Tracef("skipping own %s event: %s for: %s", registry.EventType(event.Type), event.Id, event.Service.Name)
+		return nil
+	}
+
+	log.Debugf("received %s event from: %s for: %s", registry.EventType(event.Type), event.Id, event.Service.Name)
+
+	// no service
+	if event.Service == nil {
+		return nil
+	}
+
+	// decode protobuf to registry.Service
+	svc := service.ToService(event.Service)
+
+	// default ttl to 1 minute
+	ttl := time.Minute
+
+	// set ttl if it exists
+	if opts := event.Service.Options; opts != nil {
+		if opts.Ttl > 0 {
+			ttl = time.Duration(opts.Ttl) * time.Second
+		}
+	}
+
+	switch registry.EventType(event.Type) {
+	case registry.Create, registry.Update:
+		log.Debugf("registering service: %s", svc.Name)
+		if err := s.Registry.Register(svc, registry.RegisterTTL(ttl)); err != nil {
+			log.Debugf("failed to register service: %s", svc.Name)
+			return err
+		}
+	case registry.Delete:
+		log.Debugf("deregistering service: %s", svc.Name)
+		if err := s.Registry.Deregister(svc); err != nil {
+			log.Debugf("failed to deregister service: %s", svc.Name)
+			return err
+		}
+	}
+
+	return nil
 }
 
-type Node struct {
-	Id       string            `json:"id"`
-	Address  string            `json:"address"`
-	Metadata map[string]string `json:"metadata"`
+func Run(ctx *cli.Context, srvOpts ...micro.Option) {
+	log.Init(log.WithFields(map[string]interface{}{"service": "registry"}))
+
+	if len(ctx.String("server_name")) > 0 {
+		Name = ctx.String("server_name")
+	}
+	if len(ctx.String("address")) > 0 {
+		Address = ctx.String("address")
+	}
+
+	// Init plugins
+	for _, p := range Plugins() {
+		p.Init(ctx)
+	}
+
+	// service opts
+	srvOpts = append(srvOpts, micro.Name(Name))
+	if i := time.Duration(ctx.Int("register_ttl")); i > 0 {
+		srvOpts = append(srvOpts, micro.RegisterTTL(i*time.Second))
+	}
+	if i := time.Duration(ctx.Int("register_interval")); i > 0 {
+		srvOpts = append(srvOpts, micro.RegisterInterval(i*time.Second))
+	}
+
+	// set address
+	if len(Address) > 0 {
+		srvOpts = append(srvOpts, micro.Address(Address))
+	}
+
+	// new service
+	service := micro.NewService(srvOpts...)
+	// get server id
+	id := service.Server().Options().Id
+
+	// register the handler
+	pb.RegisterRegistryHandler(service.Server(), &handler.Registry{
+		Id:        id,
+		Publisher: micro.NewPublisher(Topic, service.Client()),
+		Registry:  service.Options().Registry,
+		Auth:      service.Options().Auth,
+	})
+
+	// run the service
+	if err := service.Run(); err != nil {
+		log.Fatal(err)
+	}
 }
 
-type Endpoint struct {
-	Name     string            `json:"name"`
-	Request  *Value            `json:"request"`
-	Response *Value            `json:"response"`
-	Metadata map[string]string `json:"metadata"`
-}
+func Commands(options ...micro.Option) []*cli.Command {
+	command := &cli.Command{
+		Name:  "registry",
+		Usage: "Run the service registry",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "address",
+				Usage:   "Set the registry http address e.g 0.0.0.0:8000",
+				EnvVars: []string{"MICRO_SERVER_ADDRESS"},
+			},
+		},
+		Action: func(ctx *cli.Context) error {
+			if err := helper.UnexpectedSubcommand(ctx); err != nil {
+				return err
+			}
+			Run(ctx, options...)
+			return nil
+		},
+		Subcommands: rcli.RegistryCommands(),
+	}
 
-type Value struct {
-	Name   string   `json:"name"`
-	Type   string   `json:"type"`
-	Values []*Value `json:"values"`
-}
+	for _, p := range Plugins() {
+		if cmds := p.Commands(); len(cmds) > 0 {
+			command.Subcommands = append(command.Subcommands, cmds...)
+		}
 
-// GetService from the registry
-func GetService(service string) ([]*Service, error) {
-	return DefaultRegistry.GetService(service)
-}
+		if flags := p.Flags(); len(flags) > 0 {
+			command.Flags = append(command.Flags, flags...)
+		}
+	}
 
-// ListServices in the registry
-func ListServices() ([]*Service, error) {
-	return DefaultRegistry.ListServices()
-}
-
-// Watch the registry for updates
-func Watch() (Watcher, error) {
-	return DefaultRegistry.Watch()
+	return []*cli.Command{command}
 }

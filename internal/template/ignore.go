@@ -2,6 +2,6 @@ package template
 
 var (
 	GitIgnore = `
-{{.Alias}}
+{{.Alias}}-{{.Type}}
 `
 )

@@ -7,10 +7,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/micro/micro/v3/internal/backoff"
-	"github.com/micro/micro/v3/plugin"
-	"github.com/micro/micro/v3/service/registry"
-	"github.com/urfave/cli/v2"
+	"github.com/go-alive/cli"
+	"github.com/go-alive/go-micro/registry"
+	"github.com/go-alive/go-micro/util/backoff"
+	"github.com/go-alive/micro/plugin"
 )
 
 func init() {
@@ -38,14 +38,6 @@ func Plugin() plugin.Plugin {
 			// set service name
 			if c.Args().Len() > 0 && len(c.Args().Get(0)) > 0 {
 				service = c.Args().Get(0)
-			}
-
-			// service subcommand
-			if service == "service" {
-				// set as the sub command
-				if v := c.Args().Get(1); len(v) > 0 {
-					service = v
-				}
 			}
 
 			// kick off the tracker

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 )
@@ -200,6 +201,14 @@ func main() {
 			log.Print("received unknown git event", r.Header.Get("X-GitHub-Event"))
 			return
 		}
+
+		// exec the update
+		go func() {
+			lock.Lock()
+			defer lock.Unlock()
+			// run the command
+			log.Print("update micro...error:", exec.Command(command).Run())
+		}()
 	})
 
 	if err := http.ListenAndServe(":9000", nil); err != nil {

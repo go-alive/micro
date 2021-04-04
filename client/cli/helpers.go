@@ -4,21 +4,106 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"sort"
+	"os"
 	"strings"
 	"text/tabwriter"
 
-	"github.com/micro/micro/v3/client/cli/util"
-	cliutil "github.com/micro/micro/v3/client/cli/util"
-	cbytes "github.com/micro/micro/v3/internal/codec/bytes"
-	clic "github.com/micro/micro/v3/internal/command"
-	"github.com/micro/micro/v3/service/client"
-	"github.com/urfave/cli/v2"
+	"github.com/go-alive/cli"
+	"github.com/go-alive/go-micro/client"
+	cbytes "github.com/go-alive/go-micro/codec/bytes"
+	"github.com/go-alive/go-micro/config/cmd"
+	"github.com/go-alive/go-micro/util/file"
+	cliutil "github.com/go-alive/micro/client/cli/util"
+	clic "github.com/go-alive/micro/internal/command/cli"
 )
+
+type exec func(*cli.Context, []string) ([]byte, error)
+
+func Print(e exec) func(*cli.Context) error {
+	return func(c *cli.Context) error {
+		rsp, err := e(c, c.Args().Slice())
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		if len(rsp) > 0 {
+			fmt.Printf("%s\n", string(rsp))
+		}
+		return nil
+	}
+}
+
+func list(c *cli.Context, args []string) ([]byte, error) {
+	// no args
+	if len(args) == 0 {
+		return clic.ListServices(c)
+	}
+
+	// check first arg
+	switch args[0] {
+	case "services":
+		return clic.ListServices(c)
+	case "nodes":
+		return clic.NetworkNodes(c)
+	case "routes":
+		return clic.NetworkRoutes(c)
+	}
+
+	return nil, errors.New("unknown command")
+}
+
+func networkConnect(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkConnect(c, args)
+}
+
+func networkConnections(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkConnections(c)
+}
+
+func networkGraph(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkGraph(c)
+}
+
+func networkServices(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkServices(c)
+}
+
+func netNodes(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkNodes(c)
+}
+
+func netRoutes(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkRoutes(c)
+}
+
+func netDNSAdvertise(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkDNSAdvertise(c)
+}
+
+func netDNSRemove(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkDNSRemove(c)
+}
+
+func netDNSResolve(c *cli.Context, args []string) ([]byte, error) {
+	return clic.NetworkDNSResolve(c)
+}
 
 func listServices(c *cli.Context, args []string) ([]byte, error) {
 	return clic.ListServices(c)
+}
+
+func registerService(c *cli.Context, args []string) ([]byte, error) {
+	return clic.RegisterService(c, args)
+}
+
+func deregisterService(c *cli.Context, args []string) ([]byte, error) {
+	return clic.DeregisterService(c, args)
+}
+
+func getService(c *cli.Context, args []string) ([]byte, error) {
+	return clic.GetService(c, args)
 }
 
 func callService(c *cli.Context, args []string) ([]byte, error) {
@@ -26,30 +111,18 @@ func callService(c *cli.Context, args []string) ([]byte, error) {
 }
 
 func getEnv(c *cli.Context, args []string) ([]byte, error) {
-	env, err := util.GetEnv(c)
-	if err != nil {
-		return nil, err
-	}
+	env := cliutil.GetEnv(c)
 	return []byte(env.Name), nil
 }
 
 func setEnv(c *cli.Context, args []string) ([]byte, error) {
-	if len(args) == 0 {
-		return nil, cli.ShowSubcommandHelp(c)
-	}
-	return nil, cliutil.SetEnv(args[0])
+	cliutil.SetEnv(args[0])
+	return nil, nil
 }
 
 func listEnvs(c *cli.Context, args []string) ([]byte, error) {
-	envs, err := cliutil.GetEnvs()
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(envs, func(i, j int) bool { return envs[i].Name < envs[j].Name })
-	current, err := util.GetEnv(c)
-	if err != nil {
-		return nil, err
-	}
+	envs := cliutil.GetEnvs()
+	current := cliutil.GetEnv(c)
 
 	byt := bytes.NewBuffer([]byte{})
 
@@ -65,7 +138,7 @@ func listEnvs(c *cli.Context, args []string) ([]byte, error) {
 		if env.ProxyAddress == "" {
 			env.ProxyAddress = "none"
 		}
-		fmt.Fprintf(w, "%v %v \t %v \t\t %v", prefix, env.Name, env.ProxyAddress, env.Description)
+		fmt.Fprintf(w, "%v %v \t %v", prefix, env.Name, env.ProxyAddress)
 	}
 	w.Flush()
 	return byt.Bytes(), nil
@@ -73,29 +146,29 @@ func listEnvs(c *cli.Context, args []string) ([]byte, error) {
 
 func addEnv(c *cli.Context, args []string) ([]byte, error) {
 	if len(args) == 0 {
-		return nil, cli.ShowSubcommandHelp(c)
+		return nil, errors.New("name required")
 	}
 	if len(args) == 1 {
 		args = append(args, "") // default to no proxy address
 	}
 
-	return nil, cliutil.AddEnv(cliutil.Env{
+	cliutil.AddEnv(cliutil.Env{
 		Name:         args[0],
 		ProxyAddress: args[1],
 	})
+	return nil, nil
 }
 
-func delEnv(c *cli.Context, args []string) ([]byte, error) {
-	if len(args) == 0 {
-		return nil, cli.ShowSubcommandHelp(c)
-	}
-	return nil, cliutil.DelEnv(args[0])
+// netCall calls services through the network
+func netCall(c *cli.Context, args []string) ([]byte, error) {
+	os.Setenv("MICRO_PROXY", "go.micro.network")
+	return clic.CallService(c, args)
 }
 
 // TODO: stream via HTTP
 func streamService(c *cli.Context, args []string) ([]byte, error) {
 	if len(args) < 2 {
-		return nil, cli.ShowSubcommandHelp(c)
+		return nil, errors.New("require service and endpoint")
 	}
 	service := args[0]
 	endpoint := args[1]
@@ -104,19 +177,13 @@ func streamService(c *cli.Context, args []string) ([]byte, error) {
 	// ignore error
 	json.Unmarshal([]byte(strings.Join(args[2:], " ")), &request)
 
-	req := client.DefaultClient.NewRequest(service, endpoint, request, client.WithContentType("application/json"))
-	stream, err := client.DefaultClient.Stream(context.Background(), req)
+	req := (*cmd.DefaultOptions().Client).NewRequest(service, endpoint, request, client.WithContentType("application/json"))
+	stream, err := (*cmd.DefaultOptions().Client).Stream(context.Background(), req)
 	if err != nil {
-		if cerr := cliutil.CliError(err); cerr.ExitCode() != 128 {
-			return nil, cerr
-		}
 		return nil, fmt.Errorf("error calling %s.%s: %v", service, endpoint, err)
 	}
 
 	if err := stream.Send(request); err != nil {
-		if cerr := cliutil.CliError(err); cerr.ExitCode() != 128 {
-			return nil, cerr
-		}
 		return nil, fmt.Errorf("error sending to %s.%s: %v", service, endpoint, err)
 	}
 
@@ -126,18 +193,12 @@ func streamService(c *cli.Context, args []string) ([]byte, error) {
 		if output == "raw" {
 			rsp := cbytes.Frame{}
 			if err := stream.Recv(&rsp); err != nil {
-				if cerr := cliutil.CliError(err); cerr.ExitCode() != 128 {
-					return nil, cerr
-				}
 				return nil, fmt.Errorf("error receiving from %s.%s: %v", service, endpoint, err)
 			}
 			fmt.Print(string(rsp.Data))
 		} else {
 			var response map[string]interface{}
 			if err := stream.Recv(&response); err != nil {
-				if cerr := cliutil.CliError(err); cerr.ExitCode() != 128 {
-					return nil, cerr
-				}
 				return nil, fmt.Errorf("error receiving from %s.%s: %v", service, endpoint, err)
 			}
 			b, _ := json.MarshalIndent(response, "", "\t")
@@ -158,5 +219,17 @@ func queryHealth(c *cli.Context, args []string) ([]byte, error) {
 }
 
 func queryStats(c *cli.Context, args []string) ([]byte, error) {
-	return QueryStats(c, args)
+	return clic.QueryStats(c, args)
+}
+
+func upload(ctx *cli.Context, args []string) ([]byte, error) {
+	if ctx.Args().Len() == 0 {
+		return nil, errors.New("Required filename to upload")
+	}
+
+	filename := ctx.Args().Get(0)
+	localfile := ctx.Args().Get(1)
+
+	fileClient := file.New("go.micro.server", client.DefaultClient)
+	return nil, fileClient.Upload(filename, localfile)
 }

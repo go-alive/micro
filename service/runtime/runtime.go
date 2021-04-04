@@ -1,166 +1,238 @@
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Original source: github.com/micro/go-micro/v3/runtime/runtime.go
-
-// Package runtime is a service runtime manager
+// Package runtime is the micro runtime
 package runtime
 
 import (
-	"errors"
-	"time"
+	"os"
+
+	"github.com/go-alive/cli"
+	"github.com/go-alive/go-micro"
+	"github.com/go-alive/go-micro/config/cmd"
+	log "github.com/go-alive/go-micro/logger"
+	"github.com/go-alive/go-micro/runtime"
+	pb "github.com/go-alive/go-micro/runtime/service/proto"
+	"github.com/go-alive/micro/service/runtime/handler"
+	"github.com/go-alive/micro/service/runtime/manager"
+	"github.com/go-alive/micro/service/runtime/profile"
 )
 
 var (
-	// DefaultRuntime implementation
-	DefaultRuntime Runtime
-
-	ErrAlreadyExists   = errors.New("already exists")
-	ErrInvalidResource = errors.New("invalid resource")
-	ErrNotFound        = errors.New("not found")
+	// Name of the runtime
+	Name = "go.micro.runtime"
+	// Address of the runtime
+	Address = ":8088"
 )
 
-// Runtime is a service runtime manager
-type Runtime interface {
-	// Init initializes runtime
-	Init(...Option) error
-	// Create a resource
-	Create(Resource, ...CreateOption) error
-	// Read a resource
-	Read(...ReadOption) ([]*Service, error)
-	// Update a resource
-	Update(Resource, ...UpdateOption) error
-	// Delete a resource
-	Delete(Resource, ...DeleteOption) error
-	// Logs returns the logs for a resource
-	Logs(Resource, ...LogsOption) (LogStream, error)
-	// Start starts the runtime
-	Start() error
-	// Stop shuts down the runtime
-	Stop() error
-	// String defines the runtime implementation
-	String() string
-}
+// Run the runtime service
+func Run(ctx *cli.Context, srvOpts ...micro.Option) {
+	log.Init(log.WithFields(map[string]interface{}{"service": "runtime"}))
 
-// LogStream returns a log stream
-type LogStream interface {
-	Error() error
-	Chan() chan Log
-	Stop() error
-}
+	// Get the profile
+	var prof []string
+	switch ctx.String("profile") {
+	case "local":
+		prof = profile.Local()
+	case "server":
+		prof = profile.Server()
+	case "kubernetes":
+		prof = profile.Kubernetes()
+	case "platform":
+		prof = profile.Platform()
+	}
 
-// Log is a log message
-type Log struct {
-	Message  string
-	Metadata map[string]string
-}
+	// Init plugins
+	for _, p := range Plugins() {
+		p.Init(ctx)
+	}
 
-// EventType defines schedule event
-type EventType int
+	if len(ctx.String("address")) > 0 {
+		Address = ctx.String("address")
+	}
 
-const (
-	// CreateEvent is emitted when a new build has been craeted
-	CreateEvent EventType = iota
-	// UpdateEvent is emitted when a new update become available
-	UpdateEvent
-	// DeleteEvent is emitted when a build has been deleted
-	DeleteEvent
-)
+	if len(ctx.String("server_name")) > 0 {
+		Name = ctx.String("server_name")
+	}
 
-// String returns human readable event type
-func (t EventType) String() string {
-	switch t {
-	case CreateEvent:
-		return "create"
-	case DeleteEvent:
-		return "delete"
-	case UpdateEvent:
-		return "update"
-	default:
-		return "unknown"
+	if len(Address) > 0 {
+		srvOpts = append(srvOpts, micro.Address(Address))
+	}
+
+	// create runtime
+	muRuntime := *cmd.DefaultCmd.Options().Runtime
+	if ctx.IsSet("source") {
+		muRuntime.Init(runtime.WithSource(ctx.String("source")))
+	}
+
+	// append name
+	srvOpts = append(srvOpts, micro.Name(Name))
+
+	// new service
+	service := micro.NewService(srvOpts...)
+
+	// create a new runtime manager
+	manager := manager.New(muRuntime,
+		manager.Store(service.Options().Store),
+		manager.Profile(prof),
+	)
+
+	// start the manager
+	if err := manager.Start(); err != nil {
+		log.Errorf("failed to start: %s", err)
+		os.Exit(1)
+	}
+
+	// register the runtime handler
+	pb.RegisterRuntimeHandler(service.Server(), &handler.Runtime{
+		// Client to publish events
+		Client: micro.NewEvent("go.micro.runtime.events", service.Client()),
+		// using the micro runtime
+		Runtime: manager,
+	})
+
+	// start runtime service
+	if err := service.Run(); err != nil {
+		log.Errorf("error running service: %v", err)
+	}
+
+	// stop the manager
+	if err := manager.Stop(); err != nil {
+		log.Errorf("failed to stop: %s", err)
+		os.Exit(1)
 	}
 }
 
-// Event is notification event
-type Event struct {
-	// ID of the event
-	ID string
-	// Type is event type
-	Type EventType
-	// Timestamp is event timestamp
-	Timestamp time.Time
-	// Service the event relates to
-	Service *Service
-	// Options to use when processing the event
-	Options *CreateOptions
+// Flags is shared flags so we don't have to continually re-add
+func Flags() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{
+			Name:  "source",
+			Usage: "Set the source url of the service e.g github.com/micro/services",
+		},
+		&cli.StringFlag{
+			Name:  "image",
+			Usage: "Set the image to use for the container",
+		},
+		&cli.StringFlag{
+			Name:  "command",
+			Usage: "Command to exec",
+		},
+		&cli.StringFlag{
+			Name:  "args",
+			Usage: "Command args",
+		},
+		&cli.StringFlag{
+			Name:  "type",
+			Usage: "The type of service operate on",
+		},
+		&cli.StringSliceFlag{
+			Name:  "env_vars",
+			Usage: "Set the environment variables e.g. foo=bar",
+		},
+	}
 }
 
-// ServiceStatus defines service statuses
-type ServiceStatus int
+func Commands(options ...micro.Option) []*cli.Command {
+	command := []*cli.Command{
+		{
+			Name:  "runtime",
+			Usage: "Run the micro runtime",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:    "address",
+					Usage:   "Set the registry http address e.g 0.0.0.0:8088",
+					EnvVars: []string{"MICRO_SERVER_ADDRESS"},
+				},
+				&cli.StringFlag{
+					Name:    "profile",
+					Usage:   "Set the runtime profile to use for services e.g local, kubernetes, platform",
+					EnvVars: []string{"MICRO_RUNTIME_PROFILE"},
+				},
+				&cli.StringFlag{
+					Name:    "source",
+					Usage:   "Set the runtime source, e.g. micro/services",
+					EnvVars: []string{"MICRO_RUNTIME_SOURCE"},
+				},
+				&cli.IntFlag{
+					Name:    "retries",
+					Usage:   "Set the max retries per service",
+					EnvVars: []string{"MICRO_RUNTIME_RETRIES"},
+				},
+			},
+			Action: func(ctx *cli.Context) error {
+				Run(ctx, options...)
+				return nil
+			},
+		},
+		{
+			// In future we'll also have `micro run [x]` hence `micro run service` requiring "service"
+			Name:  "run",
+			Usage: RunUsage,
+			Description: `Examples:
+			micro run github.com/micro/services/helloworld
+			micro run . # deploy local folder to your local micro server
+			micro run helloworld # translates to micro run github.com/micro/services/helloworld
+			micro run helloworld@9342934e6180 # deploy certain version`,
+			Flags: Flags(),
+			Action: func(ctx *cli.Context) error {
+				runService(ctx, options...)
+				return nil
+			},
+		},
+		{
+			Name:  "kill",
+			Usage: KillUsage,
+			Flags: Flags(),
+			Action: func(ctx *cli.Context) error {
+				killService(ctx, options...)
+				return nil
+			},
+		},
+		{
+			Name:  "update",
+			Usage: UpdateUsage,
+			Flags: Flags(),
+			Action: func(ctx *cli.Context) error {
+				updateService(ctx, options...)
+				return nil
+			},
+		},
+		{
+			Name:  "services",
+			Usage: ServicesUsage,
+			Flags: Flags(),
+			Action: func(ctx *cli.Context) error {
+				getService(ctx, options...)
+				return nil
+			},
+		},
+		{
+			Name:  "status",
+			Usage: GetUsage,
+			Flags: Flags(),
+			Action: func(ctx *cli.Context) error {
+				getService(ctx, options...)
+				return nil
+			},
+		},
+		{
+			Name:  "logs",
+			Usage: "Get logs for a service",
+			Flags: logFlags(),
+			Action: func(ctx *cli.Context) error {
+				getLogs(ctx, options...)
+				return nil
+			},
+		},
+	}
 
-const (
-	// Unknown indicates the status of the service is not known
-	Unknown ServiceStatus = iota
-	// Pending is the initial status of a service
-	Pending
-	// Building is the status when the service is being built
-	Building
-	// Starting is the status when the service has been started but is not yet ready to accept traffic
-	Starting
-	// Running is the status when the service is active and accepting traffic
-	Running
-	// Stopping is the status when a service is stopping
-	Stopping
-	// Stopped is the status when a service has been stopped or has completed
-	Stopped
-	// Error is the status when an error occured, this could be a build error or a run error. The error
-	// details can be found within the service's metadata
-	Error
-)
+	for _, p := range Plugins() {
+		if cmds := p.Commands(); len(cmds) > 0 {
+			command[0].Subcommands = append(command[0].Subcommands, cmds...)
+		}
 
-// Resources which are allocated to a serivce
-type Resources struct {
-	// CPU is the maximum amount of CPU the service will be allocated (unit millicpu)
-	// e.g. 0.25CPU would be passed as 250
-	CPU int
-	// Mem is the maximum amount of memory the service will be allocated (unit mebibyte)
-	// e.g. 128 MiB of memory would be passed as 128
-	Mem int
-	// Disk is the maximum amount of disk space the service will be allocated (unit mebibyte)
-	// e.g. 128 MiB of memory would be passed as 128
-	Disk int
-}
+		if flags := p.Flags(); len(flags) > 0 {
+			command[0].Flags = append(command[0].Flags, flags...)
+		}
+	}
 
-// Create a resource
-func Create(resource Resource, opts ...CreateOption) error {
-	return DefaultRuntime.Create(resource, opts...)
-}
-
-// Read returns the service
-func Read(opts ...ReadOption) ([]*Service, error) {
-	return DefaultRuntime.Read(opts...)
-}
-
-// Update the resource in place
-func Update(resource Resource, opts ...UpdateOption) error {
-	return DefaultRuntime.Update(resource, opts...)
-}
-
-// Delete a resource
-func Delete(resource Resource, opts ...DeleteOption) error {
-	return DefaultRuntime.Delete(resource, opts...)
-}
-
-// Logs for a resource
-func Logs(resource Resource, opts ...LogsOption) (LogStream, error) {
-	return DefaultRuntime.Logs(resource, opts...)
+	return command
 }

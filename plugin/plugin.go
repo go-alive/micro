@@ -3,7 +3,7 @@ package plugin
 import (
 	"net/http"
 
-	"github.com/urfave/cli/v2"
+	"github.com/go-alive/cli"
 )
 
 // Plugin is the interface for plugins to micro. It differs from go-micro in that it's for
@@ -26,21 +26,8 @@ type Plugin interface {
 // Manager is the plugin manager which stores plugins and allows them to be retrieved.
 // This is used by all the components of micro.
 type Manager interface {
-	Plugins(...PluginOption) []Plugin
-	Register(Plugin, ...PluginOption) error
-}
-
-type PluginOptions struct {
-	Module string
-}
-
-type PluginOption func(o *PluginOptions)
-
-// Module will scope the plugin to a specific module, e.g. the "api"
-func Module(m string) PluginOption {
-	return func(o *PluginOptions) {
-		o.Module = m
-	}
+	Plugins() []Plugin
+	Register(Plugin) error
 }
 
 // Handler is the plugin middleware handler which wraps an existing http.Handler passed in.
@@ -97,19 +84,19 @@ func newPlugin(opts ...Option) Plugin {
 }
 
 // Plugins lists the global plugins
-func Plugins(opts ...PluginOption) []Plugin {
-	return defaultManager.Plugins(opts...)
+func Plugins() []Plugin {
+	return defaultManager.Plugins()
 }
 
 // Register registers a global plugins
-func Register(plugin Plugin, opts ...PluginOption) error {
-	return defaultManager.Register(plugin, opts...)
+func Register(plugin Plugin) error {
+	return defaultManager.Register(plugin)
 }
 
 // IsRegistered check plugin whether registered global.
 // Notice plugin is not check whether is nil
-func IsRegistered(plugin Plugin, opts ...PluginOption) bool {
-	return defaultManager.isRegistered(plugin, opts...)
+func IsRegistered(plugin Plugin) bool {
+	return defaultManager.isRegistered(plugin)
 }
 
 // NewManager creates a new plugin manager

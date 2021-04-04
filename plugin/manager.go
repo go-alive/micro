@@ -5,12 +5,10 @@ import (
 	"sync"
 )
 
-const defaultModule = "micro"
-
 type manager struct {
 	sync.Mutex
-	plugins    map[string][]Plugin
-	registered map[string]map[string]bool
+	plugins    []Plugin
+	registered map[string]bool
 }
 
 var (
@@ -20,68 +18,34 @@ var (
 
 func newManager() *manager {
 	return &manager{
-		plugins:    make(map[string][]Plugin),
-		registered: make(map[string]map[string]bool),
+		registered: make(map[string]bool),
 	}
 }
 
-func (m *manager) Plugins(opts ...PluginOption) []Plugin {
-	options := PluginOptions{Module: defaultModule}
-	for _, o := range opts {
-		o(&options)
-	}
-
+func (m *manager) Plugins() []Plugin {
 	m.Lock()
 	defer m.Unlock()
-
-	if plugins, ok := m.plugins[options.Module]; ok {
-		return plugins
-	}
-	return []Plugin{}
+	return m.plugins
 }
 
-func (m *manager) Register(plugin Plugin, opts ...PluginOption) error {
-	options := PluginOptions{Module: defaultModule}
-	for _, o := range opts {
-		o(&options)
-	}
-
+func (m *manager) Register(plugin Plugin) error {
 	m.Lock()
 	defer m.Unlock()
 
 	name := plugin.String()
 
-	if reg, ok := m.registered[options.Module]; ok && reg[name] {
+	if m.registered[name] {
 		return fmt.Errorf("Plugin with name %s already registered", name)
 	}
 
-	if _, ok := m.registered[options.Module]; !ok {
-		m.registered[options.Module] = map[string]bool{name: true}
-	} else {
-		m.registered[options.Module][name] = true
-	}
-
-	if _, ok := m.plugins[options.Module]; ok {
-		m.plugins[options.Module] = append(m.plugins[options.Module], plugin)
-	} else {
-		m.plugins[options.Module] = []Plugin{plugin}
-	}
-
+	m.registered[name] = true
+	m.plugins = append(m.plugins, plugin)
 	return nil
 }
 
-func (m *manager) isRegistered(plugin Plugin, opts ...PluginOption) bool {
-	options := PluginOptions{Module: defaultModule}
-	for _, o := range opts {
-		o(&options)
-	}
-
+func (m *manager) isRegistered(plugin Plugin) bool {
 	m.Lock()
 	defer m.Unlock()
 
-	if _, ok := m.registered[options.Module]; !ok {
-		return false
-	}
-
-	return m.registered[options.Module][plugin.String()]
+	return m.registered[plugin.String()]
 }

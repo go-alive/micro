@@ -1,111 +1,333 @@
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Original source: github.com/micro/micro/v3/router/router.go
-
 package router
 
 import (
-	"errors"
-	"hash/fnv"
+	"context"
+	"fmt"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/go-alive/cli"
+	"github.com/go-alive/go-micro"
+	log "github.com/go-alive/go-micro/logger"
+	"github.com/go-alive/go-micro/router"
+	pb "github.com/go-alive/go-micro/router/service/proto"
+	"github.com/go-alive/micro/service/router/handler"
 )
 
 var (
-	// DefaultRouter implementation
-	DefaultRouter Router
+	// Name of the router microservice
+	Name = "go.micro.router"
+	// Address is the router microservice bind address
+	Address = ":8084"
+	// Network is the network name
+	Network = router.DefaultNetwork
+	// Topic is router adverts topic
+	Topic = "go.micro.router.adverts"
 )
 
-var (
-	// DefaultLink is default network link
-	DefaultLink = "local"
-	// DefaultLocalMetric is default route cost for a local route
-	DefaultMetric int64 = 1
-	// DefaultNetwork is default micro network
-	DefaultNetwork = "micro"
-	// ErrRouteNotFound is returned when no route was found in the routing table
-	ErrRouteNotFound = errors.New("route not found")
-	// ErrDuplicateRoute is returned when the route already exists
-	ErrDuplicateRoute = errors.New("duplicate route")
-)
-
-// Router is an interface for a routing control plane
-type Router interface {
-	// Init initializes the router with options
-	Init(...Option) error
-	// Options returns the router options
-	Options() Options
-	// The routing table
-	Table() Table
-	// Lookup queries routes in the routing table
-	Lookup(service string, opts ...LookupOption) ([]Route, error)
-	// Watch returns a watcher which tracks updates to the routing table
-	Watch(opts ...WatchOption) (Watcher, error)
-	// Close the router
-	Close() error
-	// Returns the router implementation
-	String() string
+// Sub processes router events
+type sub struct {
+	router router.Router
 }
 
-// Table is an interface for routing table
-type Table interface {
-	// Create new route in the routing table
-	Create(Route) error
-	// Delete existing route from the routing table
-	Delete(Route) error
-	// Update route in the routing table
-	Update(Route) error
-	// Read is for querying the table
-	Read(...ReadOption) ([]Route, error)
+// Process processes router adverts
+func (s *sub) Process(ctx context.Context, advert *pb.Advert) error {
+	log.Debugf("received advert from: %s", advert.Id)
+	if advert.Id == s.router.Options().Id {
+		log.Debug("skipping advert")
+		return nil
+	}
+
+	var events []*router.Event
+	for _, event := range advert.Events {
+		route := router.Route{
+			Service: event.Route.Service,
+			Address: event.Route.Address,
+			Gateway: event.Route.Gateway,
+			Network: event.Route.Network,
+			Link:    event.Route.Link,
+			Metric:  event.Route.Metric,
+		}
+
+		e := &router.Event{
+			Type:      router.EventType(event.Type),
+			Timestamp: time.Unix(0, advert.Timestamp),
+			Route:     route,
+		}
+
+		events = append(events, e)
+	}
+
+	a := &router.Advert{
+		Id:        advert.Id,
+		Type:      router.AdvertType(advert.Type),
+		Timestamp: time.Unix(0, advert.Timestamp),
+		TTL:       time.Duration(advert.Ttl),
+		Events:    events,
+	}
+
+	if err := s.router.Process(a); err != nil {
+		return fmt.Errorf("failed processing advert: %s", err)
+	}
+
+	return nil
 }
 
-// Option used by the router
-type Option func(*Options)
-
-// StatusCode defines router status
-type StatusCode int
-
-const (
-	// Running means the router is up and running
-	Running StatusCode = iota
-	// Stopped means the router has been stopped
-	Stopped
-	// Error means the router has encountered error
-	Error
-)
-
-// Route is a network route
-type Route struct {
-	// Service is destination service name
-	Service string
-	// Address is service node address
-	Address string
-	// Gateway is route gateway
-	Gateway string
-	// Network is network address
-	Network string
-	// Router is router id
-	Router string
-	// Link is network link
-	Link string
-	// Metric is the route cost metric
-	Metric int64
-	// Metadata for the route
-	Metadata map[string]string
+// rtr is micro router
+type rtr struct {
+	// router is the micro router
+	router.Router
+	// publisher to publish router adverts
+	micro.Publisher
 }
 
-// Hash returns route hash sum.
-func (r *Route) Hash() uint64 {
-	h := fnv.New64()
-	h.Reset()
-	h.Write([]byte(r.Service + r.Address + r.Gateway + r.Network + r.Router + r.Link))
-	return h.Sum64()
+// newRouter creates new micro router and returns it
+func newRouter(service micro.Service, router router.Router) *rtr {
+	s := &sub{
+		router: router,
+	}
+
+	// register subscriber
+	if err := micro.RegisterSubscriber(Topic, service.Server(), s); err != nil {
+		log.Errorf("failed to subscribe to adverts: %s", err)
+		os.Exit(1)
+	}
+
+	return &rtr{
+		Router:    router,
+		Publisher: micro.NewPublisher(Topic, service.Client()),
+	}
+}
+
+// PublishAdverts publishes adverts for other routers to consume
+func (r *rtr) PublishAdverts(ch <-chan *router.Advert) error {
+	for advert := range ch {
+		var events []*pb.Event
+		for _, event := range advert.Events {
+			route := &pb.Route{
+				Service: event.Route.Service,
+				Address: event.Route.Address,
+				Gateway: event.Route.Gateway,
+				Network: event.Route.Network,
+				Link:    event.Route.Link,
+				Metric:  int64(event.Route.Metric),
+			}
+			e := &pb.Event{
+				Type:      pb.EventType(event.Type),
+				Timestamp: event.Timestamp.UnixNano(),
+				Route:     route,
+			}
+			events = append(events, e)
+		}
+
+		a := &pb.Advert{
+			Id:        r.Options().Id,
+			Type:      pb.AdvertType(advert.Type),
+			Timestamp: advert.Timestamp.UnixNano(),
+			Events:    events,
+		}
+
+		if err := r.Publish(context.Background(), a); err != nil {
+			log.Debugf("error publishing advert: %v", err)
+			return fmt.Errorf("error publishing advert: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// Start starts the micro router
+func (r *rtr) Start() error {
+	// start the router
+	if err := r.Router.Start(); err != nil {
+		return fmt.Errorf("failed to start router: %v", err)
+	}
+
+	return nil
+}
+
+// Stop stops the micro router
+func (r *rtr) Stop() error {
+	// stop the router
+	if err := r.Router.Stop(); err != nil {
+		return fmt.Errorf("failed to stop router: %v", err)
+	}
+
+	return nil
+}
+
+// Run runs the micro server
+func Run(ctx *cli.Context, srvOpts ...micro.Option) {
+	log.Init(log.WithFields(map[string]interface{}{"service": "router"}))
+
+	// Init plugins
+	for _, p := range Plugins() {
+		p.Init(ctx)
+	}
+
+	if len(ctx.String("server_name")) > 0 {
+		Name = ctx.String("server_name")
+	}
+	if len(ctx.String("address")) > 0 {
+		Address = ctx.String("address")
+	}
+	if len(ctx.String("network")) > 0 {
+		Network = ctx.String("network")
+	}
+	// default gateway address
+	var gateway string
+	if len(ctx.String("gateway")) > 0 {
+		gateway = ctx.String("gateway")
+	}
+
+	// advertise the best routes
+	strategy := router.AdvertiseLocal
+
+	if a := ctx.String("advertise_strategy"); len(a) > 0 {
+		switch a {
+		case "all":
+			strategy = router.AdvertiseAll
+		case "best":
+			strategy = router.AdvertiseBest
+		case "local":
+			strategy = router.AdvertiseLocal
+		case "none":
+			strategy = router.AdvertiseNone
+		}
+	}
+
+	// Initialise service
+	service := micro.NewService(
+		micro.Name(Name),
+		micro.Address(Address),
+		micro.RegisterTTL(time.Duration(ctx.Int("register_ttl"))*time.Second),
+		micro.RegisterInterval(time.Duration(ctx.Int("register_interval"))*time.Second),
+	)
+
+	r := router.NewRouter(
+		router.Id(service.Server().Options().Id),
+		router.Address(service.Server().Options().Id),
+		router.Network(Network),
+		router.Registry(service.Client().Options().Registry),
+		router.Gateway(gateway),
+		router.Advertise(strategy),
+	)
+
+	// register router handler
+	pb.RegisterRouterHandler(
+		service.Server(),
+		&handler.Router{
+			Router: r,
+		},
+	)
+
+	// register the table handler
+	pb.RegisterTableHandler(
+		service.Server(),
+		&handler.Table{
+			Router: r,
+		},
+	)
+
+	// create new micro router and start advertising routes
+	rtr := newRouter(service, r)
+
+	log.Info("starting micro router")
+
+	if err := rtr.Start(); err != nil {
+		log.Errorf("failed to start: %s", err)
+		os.Exit(1)
+	}
+
+	log.Info("starting to advertise")
+
+	advertChan, err := rtr.Advertise()
+	if err != nil {
+		log.Errorf("failed to advertise: %s", err)
+		log.Info("attempting to stop the router")
+		if err := rtr.Stop(); err != nil {
+			log.Errorf("failed to stop: %s", err)
+			os.Exit(1)
+		}
+		os.Exit(1)
+	}
+
+	var wg sync.WaitGroup
+	// error channel to collect router errors
+	errChan := make(chan error, 2)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errChan <- rtr.PublishAdverts(advertChan)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errChan <- service.Run()
+	}()
+
+	// we block here until either service or server fails
+	if err := <-errChan; err != nil {
+		log.Errorf("error running the router: %v", err)
+	}
+
+	log.Info("attempting to stop the router")
+
+	// stop the router
+	if err := r.Stop(); err != nil {
+		log.Errorf("failed to stop: %s", err)
+		os.Exit(1)
+	}
+
+	wg.Wait()
+
+	log.Info("successfully stopped")
+}
+
+func Commands(options ...micro.Option) []*cli.Command {
+	command := &cli.Command{
+		Name:  "router",
+		Usage: "Run the micro network router",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "address",
+				Usage:   "Set the micro router address :9093",
+				EnvVars: []string{"MICRO_SERVER_ADDRESS"},
+			},
+			&cli.StringFlag{
+				Name:    "network",
+				Usage:   "Set the micro network name: local",
+				EnvVars: []string{"MICRO_NETWORK_NAME"},
+			},
+			&cli.StringFlag{
+				Name:    "gateway",
+				Usage:   "Set the micro default gateway address. Defaults to none.",
+				EnvVars: []string{"MICRO_GATEWAY_ADDRESS"},
+			},
+			&cli.StringFlag{
+				Name:    "advertise_strategy",
+				Usage:   "Set the advertise strategy; all, best, local, none",
+				EnvVars: []string{"MICRO_ROUTER_ADVERTISE_STRATEGY"},
+			},
+		},
+		Action: func(ctx *cli.Context) error {
+			Run(ctx, options...)
+			return nil
+		},
+	}
+
+	for _, p := range Plugins() {
+		if cmds := p.Commands(); len(cmds) > 0 {
+			command.Subcommands = append(command.Subcommands, cmds...)
+		}
+
+		if flags := p.Flags(); len(flags) > 0 {
+			command.Flags = append(command.Flags, flags...)
+		}
+	}
+
+	return []*cli.Command{command}
 }

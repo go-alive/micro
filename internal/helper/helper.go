@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"strings"
 
-	"github.com/micro/micro/v3/service/context/metadata"
-	"github.com/urfave/cli/v2"
+	"github.com/go-alive/cli"
+	"github.com/go-alive/go-micro/metadata"
 )
 
 func ACMEHosts(ctx *cli.Context) []string {
@@ -71,23 +72,25 @@ func TLSConfig(ctx *cli.Context) (*tls.Config, error) {
 
 // UnexpectedSubcommand checks for erroneous subcommands and prints help and returns error
 func UnexpectedSubcommand(ctx *cli.Context) error {
-	if first := Subcommand(ctx); first != "" {
+	if first := ctx.Args().First(); first != "" {
 		// received something that isn't a subcommand
-		return cli.Exit(fmt.Sprintf("Unrecognized subcommand for %s: %s. Please refer to '%s --help'", ctx.App.Name, first, ctx.App.Name), 1)
+		return fmt.Errorf("Unrecognized subcommand for %s: %s. Please refer to '%s help'", ctx.App.Name, first, ctx.App.Name)
 	}
-	return cli.ShowSubcommandHelp(ctx)
+	return nil
 }
 
 func UnexpectedCommand(ctx *cli.Context) error {
-	commandName := ctx.Args().First()
-	return cli.Exit(fmt.Sprintf("Unrecognized micro command: %s. Please refer to 'micro --help'", commandName), 1)
+	commandName := ""
+	// We fall back to os.Args as ctx does not seem to have the original command.
+	for _, arg := range os.Args[1:] {
+		// Exclude flags
+		if !strings.HasPrefix(arg, "-") {
+			commandName = arg
+		}
+	}
+	return fmt.Errorf("Unrecognized micro command: %s. Please refer to 'micro help'", commandName)
 }
 
 func MissingCommand(ctx *cli.Context) error {
-	return cli.Exit(fmt.Sprintf("No command provided to micro. Please refer to 'micro --help'"), 1)
-}
-
-// MicroSubcommand returns the subcommand name
-func Subcommand(ctx *cli.Context) string {
-	return ctx.Args().First()
+	return fmt.Errorf("No command provided to micro. Please refer to 'micro help'")
 }

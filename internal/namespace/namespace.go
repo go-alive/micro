@@ -3,12 +3,11 @@ package namespace
 import (
 	"context"
 
-	"github.com/micro/micro/v3/service/context/metadata"
+	"github.com/go-alive/go-micro/metadata"
 )
 
 const (
-	// DefaultNamespace used by the server
-	DefaultNamespace = "micro"
+	DefaultNamespace = "go.micro"
 	// NamespaceKey is used to set/get the namespace from the context
 	NamespaceKey = "Micro-Namespace"
 )

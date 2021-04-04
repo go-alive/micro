@@ -1,187 +1,345 @@
-// Copyright 2020 Asim Aslam
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Original source: github.com/micro/go-micro/v3/auth/auth.go
-
 package auth
 
 import (
-	"context"
-	"errors"
+	"fmt"
+	"os"
+	"strings"
 	"time"
+
+	"github.com/go-alive/cli"
+	"github.com/go-alive/go-micro"
+	"github.com/go-alive/go-micro/auth"
+	srvAuth "github.com/go-alive/go-micro/auth/service"
+	pb "github.com/go-alive/go-micro/auth/service/proto"
+	"github.com/go-alive/go-micro/auth/token"
+	"github.com/go-alive/go-micro/auth/token/jwt"
+	"github.com/go-alive/go-micro/config/cmd"
+	"github.com/go-alive/go-micro/errors"
+	log "github.com/go-alive/go-micro/logger"
+	cliutil "github.com/go-alive/micro/client/cli/util"
+	"github.com/go-alive/micro/internal/client"
+	"github.com/go-alive/micro/internal/config"
+	"github.com/go-alive/micro/internal/helper"
+	"github.com/go-alive/micro/service/auth/api"
+	authHandler "github.com/go-alive/micro/service/auth/handler/auth"
+	rulesHandler "github.com/go-alive/micro/service/auth/handler/rules"
 )
 
 var (
-	// DefaultAuth implementation
-	DefaultAuth Auth
-	// ErrInvalidToken is when the token provided is not valid
-	ErrInvalidToken = errors.New("invalid token provided")
-	// ErrForbidden is when a user does not have the necessary scope to access a resource
-	ErrForbidden = errors.New("resource forbidden")
+	// Name of the service
+	Name = "go.micro.auth"
+	// Address of the service
+	Address = ":8010"
+	// ServiceFlags are provided to commands which run micro services
+	ServiceFlags = []cli.Flag{
+		&cli.StringFlag{
+			Name:    "address",
+			Usage:   "Set the auth http address e.g 0.0.0.0:8010",
+			EnvVars: []string{"MICRO_SERVER_ADDRESS"},
+		},
+		&cli.StringFlag{
+			Name:    "auth_provider",
+			EnvVars: []string{"MICRO_AUTH_PROVIDER"},
+			Usage:   "Auth provider enables account generation",
+		},
+		&cli.StringFlag{
+			Name:    "auth_public_key",
+			EnvVars: []string{"MICRO_AUTH_PUBLIC_KEY"},
+			Usage:   "Public key for JWT auth (base64 encoded PEM)",
+		},
+		&cli.StringFlag{
+			Name:    "auth_private_key",
+			EnvVars: []string{"MICRO_AUTH_PRIVATE_KEY"},
+			Usage:   "Private key for JWT auth (base64 encoded PEM)",
+		},
+	}
+	// RuleFlags are provided to commands which create or delete rules
+	RuleFlags = []cli.Flag{
+		&cli.StringFlag{
+			Name:  "scope",
+			Usage: "The scope to amend, e.g. 'user' or '*', leave blank to make public",
+		},
+		&cli.StringFlag{
+			Name:  "resource",
+			Usage: "The resource to amend in the format type:name:endpoint, e.g. service:go.micro.auth:*",
+		},
+		&cli.StringFlag{
+			Name:  "access",
+			Usage: "The access level, must be granted or denied",
+			Value: "granted",
+		},
+		&cli.IntFlag{
+			Name:  "priority",
+			Usage: "The priority level, default is 0, the greater the number the higher the priority",
+			Value: 0,
+		},
+	}
+	// AccountFlags are provided to the create account command
+	AccountFlags = []cli.Flag{
+		&cli.StringFlag{
+			Name:  "secret",
+			Usage: "The account secret (password)",
+		},
+		&cli.StringSliceFlag{
+			Name:  "scopes",
+			Usage: "Comma seperated list of scopes to give the account",
+		},
+	}
 )
 
-const (
-	// ScopePublic is the scope applied to a rule to allow access to the public
-	ScopePublic = ""
-	// ScopeAccount is the scope applied to a rule to limit to users with any valid account
-	ScopeAccount = "*"
-	// ScopeAnyNamespaceAccount is the scope applied to a rule to limit to users with any valid account regardless of issuer
-	ScopeAnyNamespaceAccount = "+"
-)
+// run the auth service
+func Run(ctx *cli.Context, srvOpts ...micro.Option) {
+	log.Init(log.WithFields(map[string]interface{}{"service": "auth"}))
 
-// Account provided by an auth provider
-type Account struct {
-	// ID of the account e.g. UUID. Should not change
-	ID string `json:"id"`
-	// Type of the account, e.g. service
-	Type string `json:"type"`
-	// Issuer of the account
-	Issuer string `json:"issuer"`
-	// Any other associated metadata
-	Metadata map[string]string `json:"metadata"`
-	// Scopes the account has access to
-	Scopes []string `json:"scopes"`
-	// Secret for the account, e.g. the password
-	Secret string `json:"secret"`
-	// Name of the account. User friendly name that might change e.g. a username or email
-	Name string `json:"name"`
+	if len(ctx.String("address")) > 0 {
+		Address = ctx.String("address")
+	}
+	if len(Address) > 0 {
+		srvOpts = append(srvOpts, micro.Address(Address))
+	}
+
+	// Init plugins
+	for _, p := range Plugins() {
+		p.Init(ctx)
+	}
+
+	// setup the handlers
+	ruleH := &rulesHandler.Rules{}
+	authH := &authHandler.Auth{}
+
+	// setup the auth handler to use JWTs
+	pubKey := ctx.String("auth_public_key")
+	privKey := ctx.String("auth_private_key")
+	if len(pubKey) > 0 || len(privKey) > 0 {
+		authH.TokenProvider = jwt.NewTokenProvider(
+			token.WithPublicKey(pubKey),
+			token.WithPrivateKey(privKey),
+		)
+	}
+
+	st := *cmd.DefaultCmd.Options().Store
+
+	// set the handlers store
+	authH.Init(auth.Store(st))
+	ruleH.Init(auth.Store(st))
+
+	// setup service
+	srvOpts = append(srvOpts, micro.Name(Name))
+	service := micro.NewService(srvOpts...)
+
+	// register handlers
+	pb.RegisterAuthHandler(service.Server(), authH)
+	pb.RegisterRulesHandler(service.Server(), ruleH)
+	pb.RegisterAccountsHandler(service.Server(), authH)
+
+	// run service
+	if err := service.Run(); err != nil {
+		log.Fatal(err)
+	}
 }
 
-// AccountToken can be short or long lived
-type AccountToken struct {
-	// The token to be used for accessing resources
-	AccessToken string `json:"access_token"`
-	// RefreshToken to be used to generate a new token
-	RefreshToken string `json:"refresh_token"`
-	// Time of token creation
-	Created time.Time `json:"created"`
-	// Time of token expiry
-	Expiry time.Time `json:"expiry"`
+func authFromContext(ctx *cli.Context) auth.Auth {
+	if cliutil.IsLocal(ctx) {
+		return *cmd.DefaultCmd.Options().Auth
+	}
+	return srvAuth.NewAuth(
+		auth.WithClient(client.New(ctx)),
+	)
 }
 
-// Expired returns a boolean indicating if the token needs to be refreshed
-func (t *AccountToken) Expired() bool {
-	return t.Expiry.Unix() < time.Now().Unix()
+// login using a token
+func login(ctx *cli.Context) {
+	// check for the token flag
+	env := cliutil.GetEnv(ctx)
+	if tok := ctx.String("token"); len(tok) > 0 {
+		_, err := authFromContext(ctx).Inspect(tok)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		if err := config.Set(tok, "micro", "auth", env.Name, "token"); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		fmt.Println("You have been logged in")
+		return
+	}
+
+	if ctx.Args().Len() != 2 {
+		fmt.Println("Usage: `micro login {id} {secret} OR micro login --token {token}`")
+		os.Exit(1)
+	}
+	id := ctx.Args().Get(0)
+	secret := ctx.Args().Get(1)
+
+	// Execute the request
+	tok, err := authFromContext(ctx).Token(auth.WithCredentials(id, secret), auth.WithExpiry(time.Hour*24))
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	// Store the access token in micro config
+	if err := config.Set(tok.AccessToken, "micro", "auth", env.Name, "token"); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	// Store the refresh token in micro config
+	if err := config.Set(tok.RefreshToken, "micro", "auth", env.Name, "refresh-token"); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	// Inform the user
+	fmt.Println("You have been logged in")
 }
 
-// Resource is an entity such as a user or
-type Resource struct {
-	// Name of the resource, e.g. go.micro.service.notes
-	Name string `json:"name"`
-	// Type of resource, e.g. service
-	Type string `json:"type"`
-	// Endpoint resource e.g NotesService.Create
-	Endpoint string `json:"endpoint"`
+// whoami returns info about the logged in user
+func whoami(ctx *cli.Context) {
+	// Get the token from micro config
+	env, _ := config.Get("env")
+	tok, err := config.Get("micro", "auth", env, "token")
+	if err != nil {
+		fmt.Println("You are not logged in")
+		os.Exit(1)
+	}
+
+	// Inspect the token
+	acc, err := authFromContext(ctx).Inspect(tok)
+	if verr, ok := err.(*errors.Error); ok {
+		fmt.Println("Error: " + verr.Detail)
+		return
+	} else if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("ID: %v; Scopes: %v\n", acc.ID, strings.Join(acc.Scopes, ", "))
 }
 
-// Access defines the type of access a rule grants
-type Access int
+//Commands for auth
+func Commands(srvOpts ...micro.Option) []*cli.Command {
+	commands := []*cli.Command{
+		{
+			Name:  "auth",
+			Usage: "Run the auth service",
+			Action: func(ctx *cli.Context) error {
+				if err := helper.UnexpectedSubcommand(ctx); err != nil {
+					return err
+				}
+				Run(ctx)
+				return nil
+			},
+			Subcommands: append([]*cli.Command{
+				{
+					Name:        "api",
+					Usage:       "Run the auth api",
+					Description: "Run the auth api",
+					Flags:       ServiceFlags,
+					Action: func(ctx *cli.Context) error {
+						api.Run(ctx, srvOpts...)
+						return nil
+					},
+				},
+				{
+					Name:  "list",
+					Usage: "List auth resources",
+					Subcommands: append([]*cli.Command{
+						{
+							Name:  "rules",
+							Usage: "List auth rules",
+							Action: func(ctx *cli.Context) error {
+								listRules(ctx)
+								return nil
+							},
+						},
+						{
+							Name:  "accounts",
+							Usage: "List auth accounts",
+							Action: func(ctx *cli.Context) error {
+								listAccounts(ctx)
+								return nil
+							},
+						},
+					}),
+				},
+				{
+					Name:  "create",
+					Usage: "Create an auth resource",
+					Subcommands: append([]*cli.Command{
+						{
+							Name:  "rule",
+							Usage: "Create an auth rule",
+							Flags: append(RuleFlags),
+							Action: func(ctx *cli.Context) error {
+								createRule(ctx)
+								return nil
+							},
+						},
+						{
+							Name:  "account",
+							Usage: "Create an auth account",
+							Flags: append(AccountFlags),
+							Action: func(ctx *cli.Context) error {
+								createAccount(ctx)
+								return nil
+							},
+						},
+					}),
+				},
+				{
+					Name:  "delete",
+					Usage: "Delete a auth resource",
+					Subcommands: append([]*cli.Command{
+						{
+							Name:  "rule",
+							Usage: "Delete an auth rule",
+							Flags: RuleFlags,
+							Action: func(ctx *cli.Context) error {
+								deleteRule(ctx)
+								return nil
+							},
+						},
+					}),
+				},
+			}),
+		},
+		{
+			Name:  "login",
+			Usage: "Login using a token",
+			Action: func(ctx *cli.Context) error {
+				login(ctx)
+				return nil
+			},
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:  "token",
+					Usage: "The token to set",
+				},
+			},
+		},
+		{
+			Name:  "whoami",
+			Usage: "Account information",
+			Action: func(ctx *cli.Context) error {
+				whoami(ctx)
+				return nil
+			},
+		},
+	}
 
-const (
-	// AccessGranted to a resource
-	AccessGranted Access = iota
-	// AccessDenied to a resource
-	AccessDenied
-)
+	for _, c := range commands {
+		for _, p := range Plugins() {
+			if cmds := p.Commands(); len(cmds) > 0 {
+				c.Subcommands = append(c.Subcommands, cmds...)
+			}
 
-// Rule is used to verify access to a resource
-type Rule struct {
-	// ID of the rule, e.g. "public"
-	ID string
-	// Scope the rule requires, a blank scope indicates open to the public and * indicates the rule
-	// applies to any valid account
-	Scope string
-	// Resource the rule applies to
-	Resource *Resource
-	// Access determines if the rule grants or denies access to the resource
-	Access Access
-	// Priority the rule should take when verifying a request, the higher the value the sooner the
-	// rule will be applied
-	Priority int32
-}
+			if flags := p.Flags(); len(flags) > 0 {
+				c.Flags = append(c.Flags, flags...)
+			}
+		}
+	}
 
-// Auth provides authentication and authorization
-type Auth interface {
-	// Init the auth
-	Init(opts ...Option)
-	// Options set for auth
-	Options() Options
-	// Generate a new account
-	Generate(id string, opts ...GenerateOption) (*Account, error)
-	// Verify an account has access to a resource using the rules
-	Verify(acc *Account, res *Resource, opts ...VerifyOption) error
-	// Inspect a token
-	Inspect(token string) (*Account, error)
-	// Token generated using refresh token or credentials
-	Token(opts ...TokenOption) (*AccountToken, error)
-	// Grant access to a resource
-	Grant(rule *Rule) error
-	// Revoke access to a resource
-	Revoke(rule *Rule) error
-	// Rules returns all the rules used to verify requests
-	Rules(...RulesOption) ([]*Rule, error)
-	// String returns the name of the implementation
-	String() string
-}
-
-// Generate a new account
-func Generate(id string, opts ...GenerateOption) (*Account, error) {
-	return DefaultAuth.Generate(id, opts...)
-}
-
-// Verify an account has access to a resource using the rules
-func Verify(acc *Account, res *Resource, opts ...VerifyOption) error {
-	return DefaultAuth.Verify(acc, res, opts...)
-}
-
-// Inspect a token
-func Inspect(token string) (*Account, error) {
-	return DefaultAuth.Inspect(token)
-}
-
-// Token generated using refresh token or credentials
-func Token(opts ...TokenOption) (*AccountToken, error) {
-	return DefaultAuth.Token(opts...)
-}
-
-// Grant access to a resource
-func Grant(rule *Rule) error {
-	return DefaultAuth.Grant(rule)
-}
-
-// Revoke access to a resource
-func Revoke(rule *Rule) error {
-	return DefaultAuth.Revoke(rule)
-}
-
-// Rules returns all the rules used to verify requests
-func Rules(...RulesOption) ([]*Rule, error) {
-	return DefaultAuth.Rules()
-}
-
-type accountKey struct{}
-
-// AccountFromContext gets the account from the context, which
-// is set by the auth wrapper at the start of a call. If the account
-// is not set, a nil account will be returned. The error is only returned
-// when there was a problem retrieving an account
-func AccountFromContext(ctx context.Context) (*Account, bool) {
-	acc, ok := ctx.Value(accountKey{}).(*Account)
-	return acc, ok
-}
-
-// ContextWithAccount sets the account in the context
-func ContextWithAccount(ctx context.Context, account *Account) context.Context {
-	return context.WithValue(ctx, accountKey{}, account)
+	return commands
 }

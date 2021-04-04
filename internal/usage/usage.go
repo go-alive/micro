@@ -13,13 +13,13 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
-	pb "github.com/micro/micro/v3/internal/usage/proto"
-	"github.com/micro/micro/v3/internal/version"
+	pb "github.com/go-alive/micro/internal/usage/proto"
+	"github.com/go-alive/micro/internal/version"
 )
 
 var (
 	// usage url
-	u = "https://micro.mu/usage"
+	u = "https://go.micro.mu/usage"
 	// usage agent
 	a = "micro/usage"
 	// usage version

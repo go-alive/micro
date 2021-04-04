@@ -4,65 +4,45 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
-	"time"
 
-	// load the cmd package to load defaults since we're using a test profile without importing
-	// micro or service
-	_ "github.com/micro/micro/v3/cmd"
-
-	"github.com/micro/micro/v3/internal/api/resolver"
-	"github.com/micro/micro/v3/profile"
-	"github.com/micro/micro/v3/service/registry"
-	"github.com/micro/micro/v3/service/router"
+	"github.com/go-alive/go-micro/api/resolver"
+	"github.com/go-alive/go-micro/client/selector"
+	"github.com/go-alive/go-micro/registry"
+	"github.com/go-alive/go-micro/registry/memory"
 )
 
-type testCase struct {
-	Host    string
-	Path    string
-	Service string
-}
-
 func TestWebResolver(t *testing.T) {
-	profile.Test.Setup(nil)
+	r := memory.NewRegistry()
 
-	t.Run("WithServicePrefix", func(t *testing.T) {
-		res := &Resolver{
-			Options: resolver.NewOptions(
-				resolver.WithServicePrefix("web"),
-			),
-			Router: router.DefaultRouter,
-		}
+	selector := selector.NewSelector(
+		selector.Registry(r),
+	)
 
-		testCases := []testCase{
-			{"localhost:8082", "/foobar", "web.foobar"},
-			{"web.micro.mu", "/foobar", "web.foobar"},
-			{"127.0.0.1:8082", "/hello", "web.hello"},
-			{"demo.m3o.app", "/bar", "web.bar"},
-		}
+	res := &Resolver{
+		Namespace: resolver.StaticNamespace("go.micro.web"),
+		Selector:  selector,
+	}
 
-		runTests(t, res, testCases)
-	})
+	testCases := []struct {
+		Host    string
+		Path    string
+		Service string
+		Type    string
+	}{
+		{"web.micro.mu", "/home", "go.micro.web.home", "domain"},
+		{"localhost:8082", "/foobar", "go.micro.web.foobar", "path"},
+		{"web.micro.mu", "/foobar", "go.micro.web.foobar", "path"},
+		{"127.0.0.1:8082", "/hello", "go.micro.web.hello", "path"},
+		{"account.micro.mu", "/", "go.micro.web.account", "domain"},
+		{"foo.m3o.app", "/bar", "foo.web.bar", "domain"},
+		{"demo.m3o.app", "/bar", "go.micro.web.bar", "path"},
+	}
 
-	t.Run("WithoutServicePrefix", func(t *testing.T) {
-		res := &Resolver{
-			Options: resolver.NewOptions(),
-			Router:  router.DefaultRouter,
-		}
-
-		testCases := []testCase{
-			{"localhost:8082", "/foobar", "foobar"},
-			{"web.micro.mu", "/foobar", "foobar"},
-			{"127.0.0.1:8082", "/hello", "hello"},
-			{"demo.m3o.app", "/bar", "bar"},
-		}
-
-		runTests(t, res, testCases)
-	})
-}
-
-func runTests(t *testing.T, res *Resolver, testCases []testCase) {
 	for _, service := range testCases {
 		t.Run(service.Host+service.Path, func(t *testing.T) {
+			// set resolver type
+			res.Type = service.Type
+
 			v := &registry.Service{
 				Name:    service.Service,
 				Version: "latest",
@@ -71,10 +51,7 @@ func runTests(t *testing.T, res *Resolver, testCases []testCase) {
 				},
 			}
 
-			registry.DefaultRegistry.Register(v)
-
-			// registry events are published to the router async (although if we don't wait the fallback should still kick in)
-			time.Sleep(time.Millisecond * 10)
+			r.Register(v)
 
 			u, err := url.Parse("https://" + service.Host + service.Path)
 			if err != nil {
@@ -92,7 +69,8 @@ func runTests(t *testing.T, res *Resolver, testCases []testCase) {
 				t.Fatalf("Failed to resolve %v", service.Host)
 			}
 
-			registry.DefaultRegistry.Deregister(v)
+			r.Deregister(v)
 		})
 	}
+
 }
