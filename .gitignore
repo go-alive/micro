@@ -34,5 +34,6 @@ micro
 dist
 
 *.bak
+*.swp
 
 test/services

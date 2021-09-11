@@ -14,31 +14,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-acme/lego/v3/providers/dns/cloudflare"
-	"github.com/gorilla/mux"
 	"github.com/go-alive/cli"
 	"github.com/go-alive/go-micro"
 	res "github.com/go-alive/go-micro/api/resolver"
 	"github.com/go-alive/go-micro/api/server"
-	"github.com/go-alive/go-micro/api/server/acme"
-	"github.com/go-alive/go-micro/api/server/acme/autocert"
-	"github.com/go-alive/go-micro/api/server/acme/certmagic"
 	"github.com/go-alive/go-micro/api/server/cors"
 	httpapi "github.com/go-alive/go-micro/api/server/http"
-	"github.com/go-alive/go-micro/auth"
 	"github.com/go-alive/go-micro/client/selector"
 	"github.com/go-alive/go-micro/config/cmd"
 	log "github.com/go-alive/go-micro/logger"
 	"github.com/go-alive/go-micro/registry"
-	"github.com/go-alive/go-micro/sync/memory"
-	apiAuth "github.com/go-alive/micro/client/api/auth"
-	inauth "github.com/go-alive/micro/internal/auth"
 	"github.com/go-alive/micro/internal/handler"
-	"github.com/go-alive/micro/internal/helper"
 	"github.com/go-alive/micro/internal/namespace"
 	"github.com/go-alive/micro/internal/resolver/web"
 	"github.com/go-alive/micro/internal/stats"
 	"github.com/go-alive/micro/plugin"
+	"github.com/gorilla/mux"
 	"github.com/serenize/snaker"
 	"golang.org/x/net/publicsuffix"
 )
@@ -59,12 +50,9 @@ var (
 	// Base path sent to web service.
 	// This is stripped from the request path
 	// Allows the web service to define absolute paths
-	BasePathHeader        = "X-Micro-Web-Base-Path"
-	statsURL              string
-	loginURL              string
-	ACMEProvider          = "autocert"
-	ACMEChallengeProvider = "cloudflare"
-	ACMECA                = acme.LetsEncryptProductionCA
+	BasePathHeader = "X-Micro-Web-Base-Path"
+	statsURL       string
+	loginURL       string
 
 	// Host name the web dashboard is served on
 	Host, _ = os.Hostname()
@@ -80,8 +68,6 @@ type srv struct {
 	nsResolver *namespace.Resolver
 	// the proxy server
 	prx *proxy
-	// auth service
-	auth auth.Auth
 }
 
 type reg struct {
@@ -176,14 +162,13 @@ func (s *srv) proxy() *proxy {
 			r.RequestURI = ""
 		}
 
+		// TODO: better error handling
 		// check to see if the endpoint was encoded in the request context
 		// by the auth wrapper
 		var endpoint *res.Endpoint
 		if val, ok := (r.Context().Value(res.Endpoint{})).(*res.Endpoint); ok {
 			endpoint = val
 		}
-
-		// TODO: better error handling
 		var err error
 		if endpoint == nil {
 			if endpoint, err = s.resolver.Resolve(r); err != nil {
@@ -428,14 +413,6 @@ func (s *srv) render(w http.ResponseWriter, r *http.Request, tmpl string, data i
 	loginTitle := "Login"
 	user := ""
 
-	if c, err := r.Cookie(inauth.TokenCookieName); err == nil && c != nil {
-		token := strings.TrimPrefix(c.Value, inauth.TokenCookieName+"=")
-		if acc, err := s.auth.Inspect(token); err == nil {
-			loginTitle = "Account"
-			user = acc.ID
-		}
-	}
-
 	if err := t.ExecuteTemplate(w, "layout", map[string]interface{}{
 		"LoginTitle": loginTitle,
 		"LoginURL":   loginURL,
@@ -479,7 +456,7 @@ func Run(ctx *cli.Context, srvOpts ...micro.Option) {
 	// Initialize Server
 	service := micro.NewService(srvOpts...)
 
-	reg := &reg{Registry: *cmd.DefaultOptions().Registry}
+	reg := &reg{Registry: *cmd.DefaultCmd.Options().Registry}
 
 	s := &srv{
 		Router:   mux.NewRouter(),
@@ -493,7 +470,6 @@ func Run(ctx *cli.Context, srvOpts ...micro.Option) {
 				selector.Registry(reg),
 			),
 		},
-		auth: *cmd.DefaultOptions().Auth,
 	}
 
 	var h http.Handler
@@ -526,66 +502,6 @@ func Run(ctx *cli.Context, srvOpts ...micro.Option) {
 
 	var opts []server.Option
 
-	if len(ctx.String("acme_provider")) > 0 {
-		ACMEProvider = ctx.String("acme_provider")
-	}
-	if ctx.Bool("enable_acme") {
-		hosts := helper.ACMEHosts(ctx)
-		opts = append(opts, server.EnableACME(true))
-		opts = append(opts, server.ACMEHosts(hosts...))
-		switch ACMEProvider {
-		case "autocert":
-			opts = append(opts, server.ACMEProvider(autocert.NewProvider()))
-		case "certmagic":
-			// TODO: support multiple providers in internal/acme as a map
-			if ACMEChallengeProvider != "cloudflare" {
-				log.Fatal("The only implemented DNS challenge provider is cloudflare")
-			}
-
-			apiToken := os.Getenv("CF_API_TOKEN")
-			if len(apiToken) == 0 {
-				log.Fatal("env variables CF_API_TOKEN and CF_ACCOUNT_ID must be set")
-			}
-
-			// create the store
-			storage := certmagic.NewStorage(
-				memory.NewSync(),
-				service.Options().Store,
-			)
-
-			config := cloudflare.NewDefaultConfig()
-			config.AuthToken = apiToken
-			config.ZoneToken = apiToken
-			challengeProvider, err := cloudflare.NewDNSProviderConfig(config)
-			if err != nil {
-				log.Fatal(err.Error())
-			}
-
-			opts = append(opts,
-				server.ACMEProvider(
-					certmagic.NewProvider(
-						acme.AcceptToS(true),
-						acme.CA(ACMECA),
-						acme.Cache(storage),
-						acme.ChallengeProvider(challengeProvider),
-						acme.OnDemand(false),
-					),
-				),
-			)
-		default:
-			log.Fatalf("%s is not a valid ACME provider\n", ACMEProvider)
-		}
-	} else if ctx.Bool("enable_tls") {
-		config, err := helper.TLSConfig(ctx)
-		if err != nil {
-			fmt.Println(err.Error())
-			return
-		}
-
-		opts = append(opts, server.EnableTLS(true))
-		opts = append(opts, server.TLSConfig(config))
-	}
-
 	// reverse wrap handler
 	plugins := append(Plugins(), plugin.Plugins()...)
 	for i := len(plugins); i > 0; i-- {
@@ -594,19 +510,12 @@ func Run(ctx *cli.Context, srvOpts ...micro.Option) {
 
 	// create the namespace resolver and the auth wrapper
 	s.nsResolver = namespace.NewResolver(Type, Namespace)
-	authWrapper := apiAuth.Wrapper(s.resolver, s.nsResolver)
 
 	// create the service and add the auth wrapper
-	srv := httpapi.NewServer(Address, server.WrapHandler(authWrapper))
+	srv := httpapi.NewServer(Address) //, server.WrapHandler(authWrapper))
 
 	srv.Init(opts...)
 	srv.Handle("/", h)
-
-	// Setup auth redirect
-	if len(ctx.String("auth_login_url")) > 0 {
-		loginURL = ctx.String("auth_login_url")
-		service.Options().Auth.Init(auth.LoginURL(loginURL))
-	}
 
 	if err := srv.Start(); err != nil {
 		log.Fatal(err)

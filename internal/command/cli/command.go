@@ -22,7 +22,7 @@ import (
 	"github.com/go-alive/go-micro/registry"
 	"github.com/go-alive/go-micro/registry/service"
 	inclient "github.com/go-alive/micro/internal/client"
-	dns "github.com/go-alive/micro/service/network/dns/proto/dns"
+	dns "github.com/go-alive/micro/proto/dns"
 
 	"github.com/olekukonko/tablewriter"
 	"github.com/serenize/snaker"

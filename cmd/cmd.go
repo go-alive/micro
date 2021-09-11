@@ -8,41 +8,16 @@ import (
 	ccli "github.com/go-alive/cli"
 	"github.com/go-alive/go-micro"
 	"github.com/go-alive/go-micro/config/cmd"
-	gostore "github.com/go-alive/go-micro/store"
 	"github.com/go-alive/micro/plugin"
-	"github.com/go-alive/micro/plugin/build"
-	"github.com/go-alive/micro/server"
-	"github.com/go-alive/micro/service"
 
 	// clients
 	"github.com/go-alive/micro/client/api"
-	"github.com/go-alive/micro/client/bot"
 	"github.com/go-alive/micro/client/cli"
 	"github.com/go-alive/micro/client/cli/new"
-	"github.com/go-alive/micro/client/cli/util"
-	"github.com/go-alive/micro/client/proxy"
 	"github.com/go-alive/micro/client/web"
 
-	// services
-	"github.com/go-alive/micro/service/auth"
-	"github.com/go-alive/micro/service/broker"
-	"github.com/go-alive/micro/service/config"
-	"github.com/go-alive/micro/service/debug"
-	"github.com/go-alive/micro/service/health"
-	"github.com/go-alive/micro/service/network"
-	"github.com/go-alive/micro/service/registry"
-	"github.com/go-alive/micro/service/router"
-	"github.com/go-alive/micro/service/runtime"
-	"github.com/go-alive/micro/service/store"
-	"github.com/go-alive/micro/service/tunnel"
-
 	// internals
-	inauth "github.com/go-alive/micro/internal/auth"
 	"github.com/go-alive/micro/internal/helper"
-	"github.com/go-alive/micro/internal/platform"
-	_ "github.com/go-alive/micro/internal/plugins"
-	"github.com/go-alive/micro/internal/update"
-	_ "github.com/go-alive/micro/internal/usage"
 )
 
 var (
@@ -56,34 +31,10 @@ var (
 )
 
 func init() {
-	// setup the build plugin
-	plugin.Register(build.Flags())
-
-	// set platform build date
-	platform.Version = BuildDate
 }
 
 func setup(app *ccli.App) {
 	app.Flags = append(app.Flags,
-		&ccli.BoolFlag{
-			Name:  "local",
-			Usage: "Enable local only development: Defaults to true.",
-		},
-		&ccli.BoolFlag{
-			Name:    "enable_acme",
-			Usage:   "Enables ACME support via Let's Encrypt. ACME hosts should also be specified.",
-			EnvVars: []string{"MICRO_ENABLE_ACME"},
-		},
-		&ccli.StringFlag{
-			Name:    "acme_hosts",
-			Usage:   "Comma separated list of hostnames to manage ACME certs for",
-			EnvVars: []string{"MICRO_ACME_HOSTS"},
-		},
-		&ccli.StringFlag{
-			Name:    "acme_provider",
-			Usage:   "The provider that will be used to communicate with Let's Encrypt. Valid options: autocert, certmagic",
-			EnvVars: []string{"MICRO_ACME_PROVIDER"},
-		},
 		&ccli.BoolFlag{
 			Name:    "enable_tls",
 			Usage:   "Enable TLS support. Expects cert and key file to be specified",
@@ -116,11 +67,6 @@ func setup(app *ccli.App) {
 			Value:   "micro",
 		},
 		&ccli.StringFlag{
-			Name:    "proxy_address",
-			Usage:   "Proxy requests via the HTTP address specified",
-			EnvVars: []string{"MICRO_PROXY_ADDRESS"},
-		},
-		&ccli.StringFlag{
 			Name:    "web_address",
 			Usage:   "Set the web UI address e.g 0.0.0.0:8082",
 			EnvVars: []string{"MICRO_WEB_ADDRESS"},
@@ -136,23 +82,13 @@ func setup(app *ccli.App) {
 			EnvVars: []string{"MICRO_NETWORK_ADDRESS"},
 		},
 		&ccli.StringFlag{
-			Name:    "router_address",
-			Usage:   "Set the micro router address e.g. :8084",
-			EnvVars: []string{"MICRO_ROUTER_ADDRESS"},
-		},
-		&ccli.StringFlag{
 			Name:    "gateway_address",
 			Usage:   "Set the micro default gateway address e.g. :9094",
 			EnvVars: []string{"MICRO_GATEWAY_ADDRESS"},
 		},
 		&ccli.StringFlag{
-			Name:    "tunnel_address",
-			Usage:   "Set the micro tunnel address e.g. :8083",
-			EnvVars: []string{"MICRO_TUNNEL_ADDRESS"},
-		},
-		&ccli.StringFlag{
 			Name:    "api_handler",
-			Usage:   "Specify the request handler to be used for mapping HTTP requests to services; {api, proxy, rpc}",
+			Usage:   "Specify the request handler to be used for mapping HTTP requests to services; {api, rpc}",
 			EnvVars: []string{"MICRO_API_HANDLER"},
 		},
 		&ccli.StringFlag{
@@ -174,23 +110,6 @@ func setup(app *ccli.App) {
 			Name:    "enable_stats",
 			Usage:   "Enable stats",
 			EnvVars: []string{"MICRO_ENABLE_STATS"},
-		},
-		&ccli.BoolFlag{
-			Name:    "auto_update",
-			Usage:   "Enable automatic updates",
-			EnvVars: []string{"MICRO_AUTO_UPDATE"},
-		},
-		&ccli.StringFlag{
-			Name:    "update_url",
-			Usage:   "Set the url to retrieve system updates from",
-			EnvVars: []string{"MICRO_UPDATE_URL"},
-			Value:   update.DefaultURL,
-		},
-		&ccli.BoolFlag{
-			Name:    "report_usage",
-			Usage:   "Report usage statistics",
-			EnvVars: []string{"MICRO_REPORT_USAGE"},
-			Value:   true,
 		},
 		&ccli.StringFlag{
 			Name:    "env",
@@ -222,20 +141,8 @@ func setup(app *ccli.App) {
 		if len(ctx.String("api_address")) > 0 {
 			api.Address = ctx.String("api_address")
 		}
-		if len(ctx.String("proxy_address")) > 0 {
-			proxy.Address = ctx.String("proxy_address")
-		}
 		if len(ctx.String("web_address")) > 0 {
 			web.Address = ctx.String("web_address")
-		}
-		if len(ctx.String("network_address")) > 0 {
-			network.Address = ctx.String("network_address")
-		}
-		if len(ctx.String("router_address")) > 0 {
-			router.Address = ctx.String("router_address")
-		}
-		if len(ctx.String("tunnel_address")) > 0 {
-			tunnel.Address = ctx.String("tunnel_address")
 		}
 		if len(ctx.String("api_namespace")) > 0 {
 			api.Namespace = ctx.String("api_namespace")
@@ -253,7 +160,6 @@ func setup(app *ccli.App) {
 			}
 		}
 
-		util.SetupCommand(ctx)
 		// now do previous before
 		if err := before(ctx); err != nil {
 			// DO NOT return this error otherwise the action will fail
@@ -261,42 +167,6 @@ func setup(app *ccli.App) {
 			fmt.Println(err)
 			os.Exit(1)
 			return err
-		}
-
-		var opts []gostore.Option
-
-		// the database is not overriden by flag then set it
-		if len(ctx.String("store_database")) == 0 {
-			opts = append(opts, gostore.Database(cmd.App().Name))
-		}
-
-		// if the table is not overriden by flag then set it
-		if len(ctx.String("store_table")) == 0 {
-			table := cmd.App().Name
-
-			// if an arg is specified use that as the name
-			// so each service has its own table preconfigured
-			if name := ctx.Args().First(); len(name) > 0 {
-				table = name
-			}
-
-			opts = append(opts, gostore.Table(table))
-		}
-
-		// TODO: move this entire initialisation elsewhere
-		// maybe in service.Run so all things are configured
-		if len(opts) > 0 {
-			(*cmd.DefaultCmd.Options().Store).Init(opts...)
-		}
-
-		// add the system rules if we're using the JWT implementation
-		// which doesn't have access to the rules in the auth service
-		if (*cmd.DefaultCmd.Options().Auth).String() == "jwt" {
-			for _, rule := range inauth.SystemRules {
-				if err := (*cmd.DefaultCmd.Options().Auth).Grant(rule); err != nil {
-					return err
-				}
-			}
 		}
 
 		return nil
@@ -336,36 +206,9 @@ func Init(options ...micro.Option) {
 func Setup(app *ccli.App, options ...micro.Option) {
 	// Add the various commands
 	app.Commands = append(app.Commands, api.Commands(options...)...)
-	app.Commands = append(app.Commands, auth.Commands()...)
-	app.Commands = append(app.Commands, bot.Commands()...)
 	app.Commands = append(app.Commands, cli.Commands()...)
-	app.Commands = append(app.Commands, broker.Commands(options...)...)
-	app.Commands = append(app.Commands, health.Commands(options...)...)
-	app.Commands = append(app.Commands, proxy.Commands(options...)...)
-	app.Commands = append(app.Commands, router.Commands(options...)...)
-	app.Commands = append(app.Commands, tunnel.Commands(options...)...)
-	app.Commands = append(app.Commands, network.Commands(options...)...)
-	app.Commands = append(app.Commands, registry.Commands(options...)...)
-	app.Commands = append(app.Commands, runtime.Commands(options...)...)
-	app.Commands = append(app.Commands, debug.Commands(options...)...)
-	app.Commands = append(app.Commands, server.Commands(options...)...)
-	app.Commands = append(app.Commands, service.Commands(options...)...)
-	app.Commands = append(app.Commands, store.Commands(options...)...)
 	app.Commands = append(app.Commands, new.Commands()...)
-	app.Commands = append(app.Commands, build.Commands()...)
 	app.Commands = append(app.Commands, web.Commands(options...)...)
-	app.Commands = append(app.Commands, config.Commands(options...)...)
-
-	// add the init command for our internal operator
-	app.Commands = append(app.Commands, &ccli.Command{
-		Name:  "init",
-		Usage: "Run the micro operator",
-		Action: func(c *ccli.Context) error {
-			platform.Init(c)
-			return nil
-		},
-		Flags: []ccli.Flag{},
-	})
 
 	// boot micro runtime
 	app.Action = func(c *ccli.Context) error {
